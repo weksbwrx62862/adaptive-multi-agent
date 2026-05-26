@@ -1043,6 +1043,8 @@ class AdaptiveMultiAgentEngine:
             "max_concurrent_children": 3,
             "llm_refine_enabled": True,
             "llm_refine_range": (3.0, 7.0),
+            "use_dag": True,  # 新增：启用 DAG 编排
+            "dag_max_workers": 4,  # 新增：DAG 最大并行数
         }
         if config:
             self.config.update(config)
@@ -1501,6 +1503,15 @@ class AdaptiveMultiAgentEngine:
         mode: AgentMode,
         **kwargs,
     ) -> Dict:
+        # 检查是否启用 DAG 模式
+        use_dag = kwargs.get("use_dag", self.config.get("use_dag", False))
+        
+        if use_dag and mode == AgentMode.ORCHESTRATOR_SUBAGENT:
+            try:
+                return self._execute_with_dag(ctx, task, context, **kwargs)
+            except Exception as e:
+                logger.warning("DAG 执行失败，降级到传统模式: %s", e)
+        
         # 优先从插件注册表查找
         plugin = self.registry.get_plugin(mode)
         if plugin is not None:
@@ -1799,6 +1810,96 @@ class AdaptiveMultiAgentEngine:
         if not passed:
             passed = "正确" in result_str and "不正确" not in result_str and "错误" not in result_str
         return passed, result_str
+
+    def _execute_with_dag(
+        self,
+        ctx,
+        task: str,
+        context: Optional[str],
+        **kwargs,
+    ) -> Dict:
+        """使用 DAG 编排器执行任务
+        
+        优势：
+          - 并行执行无依赖任务
+          - 自动拓扑排序
+          - 故障隔离
+        """
+        from .dag_orchestrator import DAGOrchestrator
+        
+        self._logger.info("使用 DAG 编排器执行任务: %s", task[:50])
+        
+        # 创建 DAG 编排器
+        dag = DAGOrchestrator(max_workers=self.config.get("dag_max_workers", 4))
+        
+        # 分解任务为子任务
+        decompose_goal = (
+            f"将以下任务分解为 2-4 个独立的子任务，每个子任务用一句话描述。\n"
+            f"必须严格返回以下 JSON 格式，不要添加其他内容：\n"
+            f'```json\n{{"subtasks": [{{"id": "1", "description": "子任务描述"}}, ...]}}\n```\n\n'
+            f"任务: {task}"
+        )
+        if context:
+            decompose_goal += f"\n\n上下文: {context}"
+        
+        # 使用子代理分解任务
+        decompose_sr = self._execute_subagent(
+            ctx, decompose_goal,
+            _mode=AgentMode.ORCHESTRATOR_SUBAGENT, **kwargs,
+        )
+        
+        subtasks = self._parse_subtasks_json(
+            decompose_sr.result or "",
+            task_type=self._last_assessment.get("task_type", "default") if hasattr(self, '_last_assessment') else "default"
+        )
+        
+        if not subtasks:
+            raise ValueError("任务分解失败")
+        
+        # 为每个子任务创建 DAG 节点
+        for i, subtask in enumerate(subtasks):
+            subtask_desc = subtask.get("description", str(subtask))
+            node_name = f"subtask_{i}"
+            
+            # 定义节点处理函数
+            def make_handler(subtask_desc: str):
+                def handler(ctx, task: str, context: Optional[str] = None, **kwargs):
+                    # 执行子任务
+                    result = self._execute_subagent(
+                        ctx, subtask_desc,
+                        context=f"这是大任务的一部分: {task}",
+                        **kwargs,
+                    )
+                    return {"success": result.status == "completed", "result": result.result}
+                return handler
+            
+            # 添加节点（无依赖，可并行执行）
+            dag.add_node(node_name, make_handler(subtask_desc))
+        
+        # 执行 DAG
+        dag_result = dag.execute(ctx, task, context, **kwargs)
+        
+        # 汇总结果
+        success = dag_result.success
+        results = dag_result.results
+        errors = dag_result.errors
+        
+        # 合并所有子任务结果
+        all_results = []
+        for node_name, result in results.items():
+            if result and result.get("success"):
+                all_results.append(result.get("result", ""))
+        
+        combined_result = "\n\n".join(all_results) if all_results else "所有子任务执行失败"
+        
+        return {
+            "success": success,
+            "result": combined_result,
+            "mode": "dag_orchestrator",
+            "subtask_count": len(subtasks),
+            "execution_order": dag_result.execution_order,
+            "parallel_groups": dag_result.parallel_groups,
+        }
 
     def _run_orchestrator_subagent(
         self, ctx, task: str, context: Optional[str], **kwargs
